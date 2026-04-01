@@ -94,8 +94,15 @@ Returns (PANE-ID PATH)."
 
 (defun claude-send-tmux--ensure-pane ()
   "Detect a Claude Code pane, prompting if needed.
+With `current-prefix-arg', skip auto-detection and always prompt.
 Returns (PANE-ID PATH).  Signals an error if no pane is found."
-  (or (claude-send-tmux--detect-pane)
+  (or (if current-prefix-arg
+          (let ((panes (claude-send-tmux--list-panes)))
+            (cond
+             ((null panes) nil)
+             ((= (length panes) 1) (car panes))
+             (t (claude-send-tmux--select-pane panes))))
+        (claude-send-tmux--detect-pane))
       (user-error "No Claude Code pane found in tmux")))
 
 ;;;; Sending
