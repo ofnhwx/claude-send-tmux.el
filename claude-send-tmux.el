@@ -12,7 +12,6 @@
 
 ;;; Code:
 
-(require 'project)
 (require 'transient)
 
 ;;;; Customization
@@ -30,7 +29,7 @@
   "Process name to detect Claude Code panes."
   :type 'string)
 
-(defcustom claude-send-tmux-preview-lines 20
+(defcustom claude-send-tmux-preview-lines 30
   "Number of trailing lines captured from the Claude Code pane as preview.
 Inserted at the top of the compose buffer as `#'-prefixed comment lines."
   :type 'integer)
@@ -67,9 +66,51 @@ Each element is (PANE-ID PATH) where PANE-ID is
     (nreverse result)))
 
 (defun claude-send-tmux--project-root ()
-  "Return the current project root directory."
-  (when-let ((proj (project-current)))
-    (expand-file-name (project-root proj))))
+  "Return the project root for the current buffer.
+Walks up from the current file or `default-directory' looking for the
+nearest `.git', so a submodule resolves to its own root rather than the
+parent repository's."
+  (let* ((start (or (and (buffer-file-name)
+                         (file-name-directory (buffer-file-name)))
+                    default-directory))
+         (root (locate-dominating-file start ".git")))
+    (when root (expand-file-name root))))
+
+(defvar claude-send-tmux--remembered-panes (make-hash-table :test 'equal)
+  "Map of project root (string) to remembered pane id (string).
+Populated when the user resolves a multi-candidate prompt, so the same
+choice can be reused on subsequent calls for the same project.")
+
+(defun claude-send-tmux--remember-pane (root pane)
+  "Remember PANE as the chosen Claude Code pane for ROOT."
+  (when (and root pane)
+    (puthash root (nth 0 pane) claude-send-tmux--remembered-panes)))
+
+(defun claude-send-tmux--remembered-pane (root panes)
+  "Return the entry from PANES previously remembered for ROOT, or nil."
+  (when root
+    (let ((id (gethash root claude-send-tmux--remembered-panes)))
+      (when id
+        (seq-find (lambda (p) (string= (nth 0 p) id)) panes)))))
+
+(defun claude-send-tmux--forget-pane (root)
+  "Forget the remembered Claude Code pane for ROOT."
+  (when root
+    (remhash root claude-send-tmux--remembered-panes)))
+
+(defun claude-send-tmux--resolve-pane (candidates root)
+  "Pick one pane from CANDIDATES for ROOT, recording the choice.
+A single candidate is auto-selected.  When multiple candidates exist
+and one matches the remembered pane for ROOT, that one is reused;
+otherwise the user is prompted and the choice is remembered."
+  (cond
+   ((null candidates) nil)
+   ((= (length candidates) 1) (car candidates))
+   (t
+    (or (claude-send-tmux--remembered-pane root candidates)
+        (let ((chosen (claude-send-tmux--select-pane candidates)))
+          (claude-send-tmux--remember-pane root chosen)
+          chosen)))))
 
 (defun claude-send-tmux--detect-pane ()
   "Detect a Claude Code pane matching the current project root.
@@ -83,16 +124,9 @@ Returns (PANE-ID PATH) or nil."
                                              (file-truename (nth 1 p)))
                                             (file-name-as-directory true-root)))
                                  panes))))
-    (cond
-     ((= (length matching) 1)
-      (car matching))
-     ((> (length matching) 1)
-      (claude-send-tmux--select-pane matching))
-     ((= (length panes) 1)
-      (car panes))
-     (panes
-      (claude-send-tmux--select-pane panes))
-     (t nil))))
+    (or (claude-send-tmux--resolve-pane matching root)
+        (claude-send-tmux--resolve-pane panes root)
+        (progn (claude-send-tmux--forget-pane root) nil))))
 
 (defun claude-send-tmux--select-pane (panes)
   "Let the user select a pane from PANES via `completing-read'.
@@ -106,14 +140,21 @@ Returns (PANE-ID PATH)."
 
 (defun claude-send-tmux--ensure-pane ()
   "Detect a Claude Code pane, prompting if needed.
-With `current-prefix-arg', skip auto-detection and always prompt.
+With `current-prefix-arg', skip auto-detection and always prompt,
+overwriting any remembered choice.
 Returns (PANE-ID PATH).  Signals an error if no pane is found."
   (or (if current-prefix-arg
-          (let ((panes (claude-send-tmux--list-panes)))
+          (let* ((root (claude-send-tmux--project-root))
+                 (panes (claude-send-tmux--list-panes)))
             (cond
              ((null panes) nil)
-             ((= (length panes) 1) (car panes))
-             (t (claude-send-tmux--select-pane panes))))
+             ((= (length panes) 1)
+              (claude-send-tmux--remember-pane root (car panes))
+              (car panes))
+             (t
+              (let ((chosen (claude-send-tmux--select-pane panes)))
+                (claude-send-tmux--remember-pane root chosen)
+                chosen))))
         (claude-send-tmux--detect-pane))
       (user-error "No Claude Code pane found in tmux")))
 
@@ -264,6 +305,12 @@ When non-nil, suffix commands reuse this instead of running pane detection.")
   (claude-send-tmux--send-key "Escape"))
 
 ;;;###autoload
+(defun claude-send-tmux-send-enter ()
+  "Send Enter to the Claude Code pane."
+  (interactive)
+  (claude-send-tmux--send-key "Enter"))
+
+;;;###autoload
 (defun claude-send-tmux-send-q ()
   "Send \"q\" to the Claude Code pane."
   (interactive)
@@ -282,11 +329,15 @@ Use \\[claude-send-tmux-message-send] to send, \\[claude-send-tmux-message-cance
                     (let* ((start (region-beginning))
                            (end (region-end))
                            (file (or (buffer-file-name) (buffer-name)))
+                           (root (claude-send-tmux--project-root))
+                           (relative (if root
+                                         (file-relative-name file root)
+                                       (file-relative-name file)))
                            (start-line (line-number-at-pos start))
                            (end-line (line-number-at-pos end))
                            (region-text (buffer-substring-no-properties start end)))
                       (concat
-                       (format "%s:%d-%d\n" (file-relative-name file) start-line end-line)
+                       (format "%s:%d-%d\n" relative start-line end-line)
                        "```\n"
                        region-text
                        (unless (string-suffix-p "\n" region-text) "\n")
@@ -332,14 +383,16 @@ Use \\[claude-send-tmux-message-send] to send, \\[claude-send-tmux-message-cance
 (transient-define-prefix claude-send-tmux-send-menu ()
   "Send a key or compose a message to the Claude Code pane, with preview."
   [:description claude-send-tmux--menu-description
+   ["Compose"
+    ("@" "Message" claude-send-tmux-message)]
    ["Choice"
     ("1" "1" claude-send-tmux-send-1)
     ("2" "2" claude-send-tmux-send-2)
     ("3" "3" claude-send-tmux-send-3)]
    ["Control"
-    ("e" "Escape" claude-send-tmux-send-escape)
-    ("q" "q" claude-send-tmux-send-q)
-    ("@" "Compose message" claude-send-tmux-message)]]
+    ("<escape>" "Escape" claude-send-tmux-send-escape)
+    ("RET" "Enter" claude-send-tmux-send-enter)
+    ("q" "q" claude-send-tmux-send-q)]]
   (interactive)
   (setq claude-send-tmux--current-target (claude-send-tmux--ensure-pane))
   (add-hook 'transient-exit-hook #'claude-send-tmux--menu-cleanup)
